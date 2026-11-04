@@ -1,0 +1,168 @@
+name: Roll back
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: The app's PLATFORM variable, as the app registry writes it.
+        type: string
+        required: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - name: Check PLATFORM
+        id: plan
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          plan="$(jq --raw-input --slurp --compact-output --ascii-output --arg ref "$GITHUB_REF" '
+            def matches($re): type == "string" and test("\\A(?:" + $re + ")\\z");
+            def key: "[a-z][a-z0-9]*(?:-[a-z0-9]+)*";
+            def resource: "[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?";
+            def project: "[a-z][a-z0-9-]{4,28}[a-z0-9]";
+            def region: "[a-z]+-[a-z]+[0-9]+";
+            def account: "[a-z][a-z0-9-]{4,28}[a-z0-9]@" + project + "\\.iam\\.gserviceaccount\\.com";
+            def check($field; valid): if valid then empty else "PLATFORM.\($field) is missing or invalid" end;
+            def fail: map("::error::\(.)\n") | add | halt_error(1);
+
+            def problems:
+              check("project"; .project | matches(project)),
+              check("region"; .region | matches(region)),
+              check("workload_identity_provider"; .workload_identity_provider | matches("projects/[0-9]{1,20}/locations/global/workloadIdentityPools/[a-z0-9-]{4,32}/providers/[a-z0-9-]{4,32}")),
+              check("service_account"; .service_account | matches(account)),
+              check("registry"; .registry | matches(region + "-docker\\.pkg\\.dev/" + project + "/" + resource)),
+              check("images"; .images | type == "object" and has("app") and all(keys[]; matches(key))),
+              check("services"; .services | type == "object" and all(.[]; type == "object" and (.name | matches(resource)) and (.environment == "production" or .environment == "staging"))),
+              check("jobs"; .images as $images | .jobs | type == "object" and all(.[]; type == "object" and (.name | matches(resource)) and (.image as $image | $images | type == "object" and ($image | type == "string") and has($image))));
+
+            (try fromjson catch null)
+            | if type == "object" then . else ["PLATFORM must hold one JSON object"] | fail end
+            | [problems] as $problems
+            | if $problems == [] then . else $problems | fail end
+            | if $ref == "refs/heads/main" then . else ["Only main rolls back production"] | fail end
+            | [.services[] | select(.environment == "production") | .name] as $services
+            | if $services != [] then . else ["PLATFORM has no production service"] | fail end
+            | {
+                project,
+                region,
+                registry,
+                workload_identity_provider,
+                service_account,
+                images: (.images | keys),
+                services: $services,
+                jobs: [.jobs[] | {name, image}]
+              }
+          ' <<<"$PLATFORM")"
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
+
+  rollback:
+    name: Roll back
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+    env:
+      PLAN: ${{ needs.plan.outputs.plan }}
+      PROJECT: ${{ fromJSON(needs.plan.outputs.plan).project }}
+      REGION: ${{ fromJSON(needs.plan.outputs.plan).region }}
+      REGISTRY: ${{ fromJSON(needs.plan.outputs.plan).registry }}
+      CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+      CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API: "false"
+    steps:
+      - name: Sign in to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ fromJSON(needs.plan.outputs.plan).workload_identity_provider }}
+          service_account: ${{ fromJSON(needs.plan.outputs.plan).service_account }}
+
+      # Each image goes back to its production-previous tag, and an image whose two tags already match stays as it is.
+      - name: Find the previous release
+        id: release
+        run: |
+          shopt -s lastpipe
+          jq --raw-output0 '.images[]' <<<"$PLAN" | mapfile -d '' -t keys
+          echo '{}' > "$RUNNER_TEMP/rollback.json"
+          for key in "${keys[@]}"; do
+            gcloud artifacts docker images list "$REGISTRY/$key" --include-tags --format=json > "$RUNNER_TEMP/versions.json"
+            jq --arg key "$key" --slurpfile versions "$RUNNER_TEMP/versions.json" '
+              def tagged($tag): $versions[0] | map(select(any(.tags[]; . == $tag))) | first;
+              def commit: [.tags[] | select(test("\\A[0-9a-f]{40}(?:[0-9a-f]{24})?-production\\z")) | rtrimstr("-production")] | first // "unknown";
+              tagged("production") as $from
+              | tagged("production-previous") as $to
+              | if $from != null and $to != null and $from.version != $to.version
+                then .[$key] = {from: $from.version, to: $to.version, from_commit: ($from | commit), to_commit: ($to | commit)}
+                else . end
+            ' "$RUNNER_TEMP/rollback.json" > "$RUNNER_TEMP/rollback.next.json"
+            mv "$RUNNER_TEMP/rollback.next.json" "$RUNNER_TEMP/rollback.json"
+          done
+          if jq --exit-status '. == {}' "$RUNNER_TEMP/rollback.json" > /dev/null; then
+            echo "::error::There is no earlier production release to roll back to. Revert the change on main instead."
+            exit 1
+          fi
+          jq --raw-output '"app=\(has("app"))"' "$RUNNER_TEMP/rollback.json" >> "$GITHUB_OUTPUT"
+
+      # Only the image changes, so the services keep their current settings.
+      - name: Deploy services without traffic
+        if: steps.release.outputs.app == 'true'
+        run: |
+          shopt -s lastpipe
+          digest="$(jq --raw-output '.app.to' "$RUNNER_TEMP/rollback.json")"
+          jq --raw-output0 '.services[]' <<<"$PLAN" | mapfile -d '' -t services
+          for name in "${services[@]}"; do
+            gcloud run deploy "$name" --image="$REGISTRY/app@$digest" --no-traffic --region="$REGION" --project="$PROJECT" --quiet
+          done
+
+      - name: Update jobs
+        run: |
+          shopt -s lastpipe
+          jq --raw-output0 --slurpfile release "$RUNNER_TEMP/rollback.json" '
+            .jobs[] | .image as $key | select($release[0] | has($key)) | .name, $key, $release[0][$key].to
+          ' <<<"$PLAN" | mapfile -d '' -t jobs
+          for ((i = 0; i < ${#jobs[@]}; i += 3)); do
+            gcloud run jobs update "${jobs[i]}" --image="$REGISTRY/${jobs[i + 1]}@${jobs[i + 2]}" --region="$REGION" --project="$PROJECT" --quiet
+          done
+
+      - name: Move traffic
+        if: steps.release.outputs.app == 'true'
+        run: |
+          shopt -s lastpipe
+          jq --raw-output0 '.services[]' <<<"$PLAN" | mapfile -d '' -t services
+          for name in "${services[@]}"; do
+            gcloud run services update-traffic "$name" --to-latest --region="$REGION" --project="$PROJECT" --quiet
+          done
+
+      # production-previous stays where it is, so a second rollback in a row finds nothing to do.
+      - name: Tag the release
+        run: |
+          shopt -s lastpipe
+          jq --raw-output0 'to_entries[] | .key, .value.to' "$RUNNER_TEMP/rollback.json" | mapfile -d '' -t release
+          for ((i = 0; i < ${#release[@]}; i += 2)); do
+            gcloud artifacts docker tags add "$REGISTRY/${release[i]}@${release[i + 1]}" "$REGISTRY/${release[i]}:production" --quiet
+          done
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Rolled back production"
+            echo
+            echo "| Image | From | To |"
+            echo "| --- | --- | --- |"
+            jq --raw-output 'to_entries[] | "| \(.key) | \(.value.from_commit[:7]) | \(.value.to_commit[:7]) |"' "$RUNNER_TEMP/rollback.json"
+            jq --raw-output --slurpfile release "$RUNNER_TEMP/rollback.json" '
+              .images - ($release[0] | keys) | if . == [] then empty else "\nUnchanged, with no earlier release: \(join(", "))" end
+            ' <<<"$PLAN"
+          } >> "$GITHUB_STEP_SUMMARY"

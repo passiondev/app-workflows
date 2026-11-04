@@ -1,0 +1,284 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: The app's PLATFORM variable, as the app registry writes it.
+        type: string
+        required: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - name: Check PLATFORM
+        id: plan
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          plan="$(jq --raw-input --slurp --compact-output --ascii-output --arg ref "$GITHUB_REF" --arg sha "$GITHUB_SHA" '
+            def matches($re): type == "string" and test("\\A(?:" + $re + ")\\z");
+            def key: "[a-z][a-z0-9]*(?:-[a-z0-9]+)*";
+            def resource: "[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?";
+            def project: "[a-z][a-z0-9-]{4,28}[a-z0-9]";
+            def region: "[a-z]+-[a-z]+[0-9]+";
+            def account: "[a-z][a-z0-9-]{4,28}[a-z0-9]@" + project + "\\.iam\\.gserviceaccount\\.com";
+            def string_map($re): type == "object" and all(to_entries[]; (.key | matches($re)) and (.value | type == "string"));
+            def check($field; valid): if valid then empty else "PLATFORM.\($field) is missing or invalid" end;
+            def fail: map("::error::\(.)\n") | add | halt_error(1);
+
+            def problems:
+              check("project"; .project | matches(project)),
+              check("region"; .region | matches(region)),
+              check("workload_identity_provider"; .workload_identity_provider | matches("projects/[0-9]{1,20}/locations/global/workloadIdentityPools/[a-z0-9-]{4,32}/providers/[a-z0-9-]{4,32}")),
+              check("service_account"; .service_account | matches(account)),
+              check("registry"; .registry | matches(region + "-docker\\.pkg\\.dev/" + project + "/" + resource)),
+              check("images"; .images | type == "object" and has("app") and all(to_entries[]; (.key | matches(key)) and (.value | matches("[A-Za-z0-9_-][A-Za-z0-9._/-]*") and (contains("..") | not)))),
+              check("staging_branch"; .staging_branch | . == null or (matches("[A-Za-z0-9._/-]{1,100}") and . != "main")),
+              check("build_args"; .build_args | type == "object" and all(to_entries[]; (.key == "production" or .key == "staging") and (.value | string_map("[A-Za-z_][A-Za-z0-9_]*") and (has("APP_VERSION") or has("APP_ENV") | not)))),
+              check("services"; .services | type == "object" and length > 0),
+              (.services | objects | to_entries[] | .key as $key | .value
+                | if $key | matches(key) | not then "PLATFORM.services has an invalid key"
+                  elif type != "object" then "PLATFORM.services.\($key) is invalid"
+                  else
+                    check("services.\($key).name"; .name | matches(resource)),
+                    check("services.\($key).environment"; .environment == "production" or .environment == "staging"),
+                    check("services.\($key).service_account"; .service_account | matches(account)),
+                    check("services.\($key).env"; .env | string_map("[A-Z][A-Z0-9_]*")),
+                    check("services.\($key).cloudsql"; .cloudsql | . == null or matches(project + ":" + region + ":[a-z](?:[a-z0-9-]{0,96}[a-z0-9])?")),
+                    check("services.\($key).health"; .health | . == null or matches("/[A-Za-z0-9._~/-]*")),
+                    check("services.\($key).url"; .url | matches("https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}"))
+                  end),
+              check("jobs"; .jobs | type == "object"),
+              (.images as $images | .jobs | objects | to_entries[] | .key as $key | .value
+                | if $key | matches(key) | not then "PLATFORM.jobs has an invalid key"
+                  elif type != "object" then "PLATFORM.jobs.\($key) is invalid"
+                  else
+                    check("jobs.\($key).name"; .name | matches(resource)),
+                    check("jobs.\($key).image"; .image as $image | $images | type == "object" and ($image | type == "string") and has($image))
+                  end);
+
+            (try fromjson catch null)
+            | if type == "object" then . else ["PLATFORM must hold one JSON object"] | fail end
+            | [problems] as $problems
+            | if $problems == [] then . else $problems | fail end
+            | (if $ref == "refs/heads/main" then "production"
+               elif .staging_branch != null and $ref == "refs/heads/" + .staging_branch then "staging"
+               else null end) as $environment
+            | if $environment != null then . else ["Only main deploys to production, and only the staging branch to staging"] | fail end
+            | [.services[] | select(.environment == $environment) | {name, service_account, env, cloudsql, health, url}] as $services
+            | if $services != [] then . else ["PLATFORM has no \($environment) service"] | fail end
+            | if $sha | matches("[0-9a-f]{40}(?:[0-9a-f]{24})?") then . else ["GITHUB_SHA is not a commit hash"] | fail end
+            | {
+                environment: $environment,
+                project,
+                region,
+                registry,
+                workload_identity_provider,
+                service_account,
+                tag: "\($sha)-\($environment)",
+                build_args: [(.build_args[$environment] // {} | to_entries[] | "\(.key)=\(.value)"), "APP_VERSION=\($sha)", "APP_ENV=\($environment)"],
+                images: (if $environment == "production" then .images else {app: .images.app} end),
+                services: $services,
+                jobs: (if $environment == "production" then [.jobs[] | {name, image}] else [] end)
+              }
+          ' <<<"$PLATFORM")"
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan for secrets
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "$GITLEAKS_SHA256  $archive" | sha256sum --check --strict
+          tar --extract --gzip --file="$archive" --directory="$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --redact --verbose --no-banner --log-opts=HEAD .
+
+      - name: Audit npm dependencies
+        run: |
+          shopt -s lastpipe
+          git ls-files -z -- ':(glob)**/package-lock.json' | mapfile -d '' -t lockfiles
+          for lockfile in "${lockfiles[@]}"; do
+            if [[ "/$lockfile" == */node_modules/* ]]; then
+              continue
+            fi
+            directory="$(dirname -- "$lockfile")"
+            printf 'npm audit in %q\n' "$directory"
+            (cd -- "$directory" && npm audit --audit-level=critical)
+          done
+
+  deploy:
+    name: Deploy
+    needs: [plan, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PLAN: ${{ needs.plan.outputs.plan }}
+      ENVIRONMENT: ${{ fromJSON(needs.plan.outputs.plan).environment }}
+      PROJECT: ${{ fromJSON(needs.plan.outputs.plan).project }}
+      REGION: ${{ fromJSON(needs.plan.outputs.plan).region }}
+      REGISTRY: ${{ fromJSON(needs.plan.outputs.plan).registry }}
+      TAG: ${{ fromJSON(needs.plan.outputs.plan).tag }}
+      CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+      CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API: "false"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Builds run before sign-in, so no build can reach Google credentials, and the credentials file never lands in a build context.
+      - name: Build images
+        run: |
+          shopt -s lastpipe
+          workspace="$(realpath -e -- "$GITHUB_WORKSPACE")"
+          jq --raw-output0 '.build_args[]' <<<"$PLAN" | mapfile -d '' -t build_args
+          jq --raw-output0 '.images | to_entries[] | .key, .value' <<<"$PLAN" | mapfile -d '' -t images
+          for ((i = 0; i < ${#images[@]}; i += 2)); do
+            key="${images[i]}"
+            if ! dockerfile="$(realpath -e -- "${images[i + 1]}")" || [[ "$dockerfile" != "$workspace"/* || ! -f "$dockerfile" ]]; then
+              echo "::error::The $key image needs a Dockerfile at ${images[i + 1]} in the repo"
+              exit 1
+            fi
+            docker build --pull --file="$dockerfile" "${build_args[@]/#/--build-arg=}" --tag="$REGISTRY/$key:$TAG" .
+          done
+
+      - name: Sign in to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ fromJSON(needs.plan.outputs.plan).workload_identity_provider }}
+          service_account: ${{ fromJSON(needs.plan.outputs.plan).service_account }}
+
+      # Records each image's new digest, the digest the environment ran before, and whether that one becomes the previous release.
+      # It doesn't when it was built from this same commit, so a rerun keeps the release before it.
+      - name: Push images
+        run: |
+          shopt -s lastpipe
+          gcloud auth configure-docker "${REGISTRY%%/*}" --quiet
+          jq --raw-output0 '.images | keys[]' <<<"$PLAN" | mapfile -d '' -t keys
+          echo '{}' > "$RUNNER_TEMP/release.json"
+          for key in "${keys[@]}"; do
+            image="$REGISTRY/$key"
+            gcloud artifacts docker images list "$image" --include-tags --format=json > "$RUNNER_TEMP/versions.json"
+            docker push --quiet "$image:$TAG"
+            docker image inspect --format='{{json .RepoDigests}}' "$image:$TAG" \
+              | jq --raw-output --arg prefix "$image@" 'map(select(startswith($prefix)) | ltrimstr($prefix)) | if length == 1 then .[0] else error("expected one pushed digest") end' \
+              | read -r digest
+            jq --arg key "$key" --arg digest "$digest" --arg environment "$ENVIRONMENT" --arg tag "$TAG" --slurpfile versions "$RUNNER_TEMP/versions.json" '
+              ($versions[0] | map(select(any(.tags[]; . == $environment))) | first) as $current
+              | .[$key] = {
+                  digest: $digest,
+                  current: $current.version,
+                  shift: ($current != null and all($current.tags[]; . != $tag))
+                }
+            ' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/release.next.json"
+            mv "$RUNNER_TEMP/release.next.json" "$RUNNER_TEMP/release.json"
+          done
+
+      - name: Deploy services without traffic
+        run: |
+          shopt -s lastpipe
+          digest="$(jq --raw-output '.app.digest' "$RUNNER_TEMP/release.json")"
+          count="$(jq '.services | length' <<<"$PLAN")"
+          for ((i = 0; i < count; i++)); do
+            jq --raw-output0 --argjson i "$i" '.services[$i] | .name, .service_account, .cloudsql // "", .health // ""' <<<"$PLAN" \
+              | mapfile -d '' -t service
+            jq --argjson i "$i" '.services[$i].env' <<<"$PLAN" > "$RUNNER_TEMP/env.json"
+            flags=(
+              --image="$REGISTRY/app@$digest"
+              --service-account="${service[1]}"
+              --env-vars-file="$RUNNER_TEMP/env.json"
+              --no-traffic
+            )
+            if [[ -n "${service[2]}" ]]; then
+              flags+=(--set-cloudsql-instances="${service[2]}")
+            else
+              flags+=(--clear-cloudsql-instances)
+            fi
+            if [[ -n "${service[3]}" ]]; then
+              flags+=(--startup-probe="httpGet.path=${service[3]},periodSeconds=10,timeoutSeconds=5,failureThreshold=24")
+            else
+              flags+=(--startup-probe=)
+            fi
+            gcloud run deploy "${service[0]}" "${flags[@]}" --region="$REGION" --project="$PROJECT" --quiet
+          done
+
+      - name: Update jobs
+        run: |
+          shopt -s lastpipe
+          jq --raw-output0 --slurpfile release "$RUNNER_TEMP/release.json" '.jobs[] | .name, .image, $release[0][.image].digest' <<<"$PLAN" \
+            | mapfile -d '' -t jobs
+          for ((i = 0; i < ${#jobs[@]}; i += 3)); do
+            gcloud run jobs update "${jobs[i]}" --image="$REGISTRY/${jobs[i + 1]}@${jobs[i + 2]}" --region="$REGION" --project="$PROJECT" --quiet
+          done
+
+      - name: Move traffic
+        run: |
+          shopt -s lastpipe
+          jq --raw-output0 '.services[].name' <<<"$PLAN" | mapfile -d '' -t services
+          for name in "${services[@]}"; do
+            gcloud run services update-traffic "$name" --to-latest --region="$REGION" --project="$PROJECT" --quiet
+          done
+
+      - name: Tag the release
+        run: |
+          shopt -s lastpipe
+          jq --raw-output0 'to_entries[] | select(.value.shift) | .key, .value.current' "$RUNNER_TEMP/release.json" | mapfile -d '' -t previous
+          for ((i = 0; i < ${#previous[@]}; i += 2)); do
+            gcloud artifacts docker tags add "$REGISTRY/${previous[i]}@${previous[i + 1]}" "$REGISTRY/${previous[i]}:$ENVIRONMENT-previous" --quiet
+          done
+          jq --raw-output0 'to_entries[] | .key, .value.digest' "$RUNNER_TEMP/release.json" | mapfile -d '' -t current
+          for ((i = 0; i < ${#current[@]}; i += 2)); do
+            gcloud artifacts docker tags add "$REGISTRY/${current[i]}@${current[i + 1]}" "$REGISTRY/${current[i]}:$ENVIRONMENT" --quiet
+          done
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Deployed ${GITHUB_SHA:0:7} to $ENVIRONMENT"
+            echo
+            echo "| Service | URL |"
+            echo "| --- | --- |"
+            jq --raw-output '.services[] | "| \(.name) | <\(.url)> |"' <<<"$PLAN"
+            if jq --exit-status '.jobs != []' <<<"$PLAN" > /dev/null; then
+              echo
+              echo "| Job | Image |"
+              echo "| --- | --- |"
+              jq --raw-output '.jobs[] | "| \(.name) | \(.image) |"' <<<"$PLAN"
+            fi
+            echo
+            echo "| Image | Digest |"
+            echo "| --- | --- |"
+            jq --raw-output 'to_entries[] | "| \(.key) | `\(.value.digest)` |"' "$RUNNER_TEMP/release.json"
+          } >> "$GITHUB_STEP_SUMMARY"
