@@ -259,16 +259,28 @@ jobs:
             gcloud run services update-traffic "$name" --to-latest --region="$REGION" --project="$PROJECT" --quiet
           done
 
+      # `gcloud artifacts docker tags add` moves a tag by deleting it and making it again, and the deploy identity can only update one.
       - name: Tag the release
         run: |
           shopt -s lastpipe
+          IFS=/ read -r host project repository <<<"$REGISTRY"
+          point() {
+            local where=(--project="$project" --location="${host%-docker.pkg.dev}" --repository="$repository" --package="$1")
+            local tags
+            tags="$(gcloud artifacts tags list "${where[@]}" --format='value(name.basename())')"
+            if grep --quiet --line-regexp --fixed-strings -- "$3" <<<"$tags"; then
+              gcloud artifacts tags update "$3" "${where[@]}" --version="$2" --quiet
+            else
+              gcloud artifacts tags create "$3" "${where[@]}" --version="$2" --quiet
+            fi
+          }
           jq --raw-output0 'to_entries[] | select(.value.shift) | .key, .value.current' "$RUNNER_TEMP/release.json" | mapfile -d '' -t previous
           for ((i = 0; i < ${#previous[@]}; i += 2)); do
-            gcloud artifacts docker tags add "$REGISTRY/${previous[i]}@${previous[i + 1]}" "$REGISTRY/${previous[i]}:$ENVIRONMENT-previous" --quiet
+            point "${previous[i]}" "${previous[i + 1]}" "$ENVIRONMENT-previous"
           done
           jq --raw-output0 'to_entries[] | .key, .value.digest' "$RUNNER_TEMP/release.json" | mapfile -d '' -t current
           for ((i = 0; i < ${#current[@]}; i += 2)); do
-            gcloud artifacts docker tags add "$REGISTRY/${current[i]}@${current[i + 1]}" "$REGISTRY/${current[i]}:$ENVIRONMENT" --quiet
+            point "${current[i]}" "${current[i + 1]}" "$ENVIRONMENT"
           done
 
       - name: Summarize
