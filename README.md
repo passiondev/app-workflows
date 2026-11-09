@@ -69,7 +69,7 @@ GitHub keeps only the newest pending run in a group, so a deploy queued behind a
 - `staging_branch`, or null when the app has no staging service.
 - `build_args`, the extra Docker build args for `production` and for `staging`.
 - `services`, each service's name, environment, runtime service account, full environment, Cloud SQL connection, health path and URL.
-- `jobs`, each job's name and the image key it runs.
+- `jobs`, each job's name, the image key it runs, and its `command` and `args`, each null or a list.
 
 The workload identity pool only issues tokens to runs of these two workflows at `refs/tags/v1`, from repositories in the organization.
 The app's deploy service account only trusts its own repository.
@@ -89,7 +89,7 @@ Any other ref fails.
    4. It deploys each of the environment's services as a new revision without traffic, with the new image by digest, the runtime service account, the full environment, the Cloud SQL connection and a startup probe on the health path.
       An app without a health path gets Cloud Run's default TCP probe.
       Cloud Run waits for the probe, so a release that never gets healthy stops here, while the old revisions keep serving.
-   5. In production, it points every job at its new image.
+   5. In production, it points every job at its new image, with the job's `command` and `args`.
    6. It sends all traffic to the new revisions.
    7. It tags the release, as described below.
    8. It writes a summary with the services' URLs and the images' digests.
@@ -108,7 +108,7 @@ Rerunning a deploy of the commit an environment already runs only moves `<enviro
 
 To roll production back, run **Roll back** from main in the app repo's Actions tab.
 It moves each image back to its `production-previous` tag, deploys that image to every production service and job that uses it, and moves `production` to it.
-It changes the code only, so the services keep the environment, Cloud SQL connection and probe of the latest deploy.
+It changes the code only, so the services keep the environment, Cloud SQL connection and probe of the latest deploy, and the jobs keep its `command` and `args`.
 `production-previous` stays where it is, so a second rollback in a row finds nothing to roll back to and fails.
 To go back further, revert the change on main, which deploys like any other change.
 The next deploy from main moves forward as usual.
