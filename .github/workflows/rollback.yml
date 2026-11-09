@@ -146,12 +146,15 @@ jobs:
           done
 
       # production-previous stays where it is, so a second rollback in a row finds nothing to do.
+      # `gcloud artifacts docker tags add` moves a tag by deleting it and making it again, and the deploy identity can only update one.
       - name: Tag the release
         run: |
           shopt -s lastpipe
+          IFS=/ read -r host project repository <<<"$REGISTRY"
           jq --raw-output0 'to_entries[] | .key, .value.to' "$RUNNER_TEMP/rollback.json" | mapfile -d '' -t release
           for ((i = 0; i < ${#release[@]}; i += 2)); do
-            gcloud artifacts docker tags add "$REGISTRY/${release[i]}@${release[i + 1]}" "$REGISTRY/${release[i]}:production" --quiet
+            gcloud artifacts tags update production --project="$project" --location="${host%-docker.pkg.dev}" --repository="$repository" \
+              --package="${release[i]}" --version="${release[i + 1]}" --quiet
           done
 
       - name: Summarize
