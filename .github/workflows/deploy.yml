@@ -36,6 +36,7 @@ jobs:
             def region: "[a-z]+-[a-z]+[0-9]+";
             def account: "[a-z][a-z0-9-]{4,28}[a-z0-9]@" + project + "\\.iam\\.gserviceaccount\\.com";
             def string_map($re): type == "object" and all(to_entries[]; (.key | matches($re)) and (.value | type == "string"));
+            def words: type == "array" and all(.[]; matches("[^[:cntrl:]]+"));
             def check($field; valid): if valid then empty else "PLATFORM.\($field) is missing or invalid" end;
             def fail: map("::error::\(.)\n") | add | halt_error(1);
 
@@ -67,7 +68,9 @@ jobs:
                   elif type != "object" then "PLATFORM.jobs.\($key) is invalid"
                   else
                     check("jobs.\($key).name"; .name | matches(resource)),
-                    check("jobs.\($key).image"; .image as $image | $images | type == "object" and ($image | type == "string") and has($image))
+                    check("jobs.\($key).image"; .image as $image | $images | type == "object" and ($image | type == "string") and has($image)),
+                    check("jobs.\($key).command"; has("command") and (.command | . == null or (words and length > 0))),
+                    check("jobs.\($key).args"; has("args") and (.args | . == null or words))
                   end);
 
             (try fromjson catch null)
@@ -92,7 +95,7 @@ jobs:
                 build_args: [(.build_args[$environment] // {} | to_entries[] | "\(.key)=\(.value)"), "APP_VERSION=\($sha)", "APP_ENV=\($environment)"],
                 images: (if $environment == "production" then .images else {app: .images.app} end),
                 services: $services,
-                jobs: (if $environment == "production" then [.jobs[] | {name, image}] else [] end)
+                jobs: (if $environment == "production" then [.jobs[] | {name, image, command, args}] else [] end)
               }
           ' <<<"$PLATFORM")"
           echo "plan=$plan" >> "$GITHUB_OUTPUT"
@@ -234,13 +237,18 @@ jobs:
             gcloud run deploy "${service[0]}" "${flags[@]}" --region="$REGION" --project="$PROJECT" --quiet
           done
 
+      # gcloud splits a list on the delimiter between the leading carets, and Plan makes sure no word holds a control character.
+      # An empty list resets the field to the image's own.
       - name: Update jobs
         run: |
           shopt -s lastpipe
-          jq --raw-output0 --slurpfile release "$RUNNER_TEMP/release.json" '.jobs[] | .name, .image, $release[0][.image].digest' <<<"$PLAN" \
-            | mapfile -d '' -t jobs
-          for ((i = 0; i < ${#jobs[@]}; i += 3)); do
-            gcloud run jobs update "${jobs[i]}" --image="$REGISTRY/${jobs[i + 1]}@${jobs[i + 2]}" --region="$REGION" --project="$PROJECT" --quiet
+          jq --raw-output0 --slurpfile release "$RUNNER_TEMP/release.json" '
+            def list: if . == null or . == [] then "" else "^\u001f^" + join("\u001f") end;
+            .jobs[] | .name, "\(.image)@\($release[0][.image].digest)", (.command | list), (.args | list)
+          ' <<<"$PLAN" | mapfile -d '' -t jobs
+          for ((i = 0; i < ${#jobs[@]}; i += 4)); do
+            gcloud run jobs update "${jobs[i]}" --image="$REGISTRY/${jobs[i + 1]}" --command="${jobs[i + 2]}" --args="${jobs[i + 3]}" \
+              --region="$REGION" --project="$PROJECT" --quiet
           done
 
       - name: Move traffic
