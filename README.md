@@ -65,7 +65,10 @@ GitHub keeps only the newest pending run in a group, so a deploy queued behind a
 
 - `project`, `region` and `registry`, the app's project and its Artifact Registry repository.
 - `workload_identity_provider` and `service_account`, the app's deploy identity.
-- `images`, each image key and its Dockerfile path, where `app` is always `Dockerfile`.
+- `images`, each production image key and its Dockerfile path, where `app` is always `Dockerfile`.
+- `staging_images`, optional companion artifacts to build and push alongside `app` on staging only.
+  Keys cannot overlap `images`.
+  This workflow does not run the companions; the registry manages their activation by digest.
 - `staging_branch`, or null when the app has no staging service.
 - `build_args`, the extra Docker build args for `production` and for `staging`.
 - `services`, each service's name, environment, runtime service account, full environment, Cloud SQL connection, health path and URL.
@@ -83,7 +86,7 @@ Any other ref fails.
 1. **Plan** checks `PLATFORM` and the branch, then works out the environment, images, services and jobs to deploy.
 2. **Scan** runs gitleaks over the commit's full history and `npm audit --audit-level=critical` in every folder with a tracked `package-lock.json`.
 3. **Deploy** runs once both pass:
-   1. It builds every image, or only `app` for staging, with the environment's build args plus `APP_VERSION`, the commit, and `APP_ENV`, the environment.
+   1. It builds every production image on main, or `app` plus any `staging_images` on staging, with the environment's build args plus `APP_VERSION`, the commit, and `APP_ENV`, the environment.
    2. It signs in to Google Cloud as the app's deploy service account.
    3. It pushes each image, tagged `<commit>-<environment>`.
    4. It deploys each of the environment's services as a new revision without traffic, with the new image by digest, the runtime service account, the full environment, the Cloud SQL connection and a startup probe on the health path.

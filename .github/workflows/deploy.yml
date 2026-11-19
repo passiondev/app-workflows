@@ -36,6 +36,7 @@ jobs:
             def region: "[a-z]+-[a-z]+[0-9]+";
             def account: "[a-z][a-z0-9-]{4,28}[a-z0-9]@" + project + "\\.iam\\.gserviceaccount\\.com";
             def string_map($re): type == "object" and all(to_entries[]; (.key | matches($re)) and (.value | type == "string"));
+            def dockerfiles: type == "object" and all(to_entries[]; (.key | matches(key)) and (.value | matches("[A-Za-z0-9_-][A-Za-z0-9._/-]*") and (contains("..") | not)));
             def words: type == "array" and all(.[]; matches("[^[:cntrl:]]+"));
             def check($field; valid): if valid then empty else "PLATFORM.\($field) is missing or invalid" end;
             def fail: map("::error::\(.)\n") | add | halt_error(1);
@@ -46,7 +47,9 @@ jobs:
               check("workload_identity_provider"; .workload_identity_provider | matches("projects/[0-9]{1,20}/locations/global/workloadIdentityPools/[a-z0-9-]{4,32}/providers/[a-z0-9-]{4,32}")),
               check("service_account"; .service_account | matches(account)),
               check("registry"; .registry | matches(region + "-docker\\.pkg\\.dev/" + project + "/" + resource)),
-              check("images"; .images | type == "object" and has("app") and all(to_entries[]; (.key | matches(key)) and (.value | matches("[A-Za-z0-9_-][A-Za-z0-9._/-]*") and (contains("..") | not)))),
+              check("images"; .images | dockerfiles and has("app")),
+              check("staging_images"; .images as $images | if has("staging_images") then .staging_images | dockerfiles
+                and all(keys[]; . as $key | ($images | objects | has($key) | not)) else true end),
               check("staging_branch"; .staging_branch | . == null or (matches("[A-Za-z0-9._/-]{1,100}") and . != "main")),
               check("build_args"; .build_args | type == "object" and all(to_entries[]; (.key == "production" or .key == "staging") and (.value | string_map("[A-Za-z_][A-Za-z0-9_]*") and (has("APP_VERSION") or has("APP_ENV") | not)))),
               check("services"; .services | type == "object" and length > 0),
@@ -93,7 +96,7 @@ jobs:
                 service_account,
                 tag: "\($sha)-\($environment)",
                 build_args: [(.build_args[$environment] // {} | to_entries[] | "\(.key)=\(.value)"), "APP_VERSION=\($sha)", "APP_ENV=\($environment)"],
-                images: (if $environment == "production" then .images else {app: .images.app} end),
+                images: (if $environment == "production" then .images else {app: .images.app} + (.staging_images // {}) end),
                 services: $services,
                 jobs: (if $environment == "production" then [.jobs[] | {name, image, command, args}] else [] end)
               }
