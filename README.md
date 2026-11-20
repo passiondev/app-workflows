@@ -97,6 +97,12 @@ Any other ref fails.
    7. It tags the release, as described below.
    8. It writes a summary with the services' URLs and the images' digests.
 
+An app can set `staging_release_evidence: true` and upload `staging-release-evidence.json` in an Actions artifact named `staging-release-evidence` from its required checks in the same run.
+The file must name the checked commit in `sourceSha` and be at most 2,010,000 bytes.
+On staging only, Deploy attaches that file to the exact pushed `app` digest and confirms the attachment target and file hash before moving traffic.
+An existing attachment is accepted only when it identifies the same digest and bytes.
+Production and callers that do not opt in never download or publish this evidence.
+
 Everything else about services and jobs, such as scaling, ingress, sign-in, schedules and job settings, belongs to the registry's Terraform.
 
 ## Releases and tags

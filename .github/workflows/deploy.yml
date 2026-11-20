@@ -7,6 +7,10 @@ on:
         description: The app's PLATFORM variable, as the app registry writes it.
         type: string
         required: true
+      staging_release_evidence:
+        description: Attach the caller's verified staging-release-evidence.json to the staging app image before moving traffic.
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -180,6 +184,13 @@ jobs:
             docker build --pull --file="$dockerfile" "${build_args[@]/#/--build-arg=}" --tag="$REGISTRY/$key:$TAG" .
           done
 
+      - name: Download verified staging release evidence
+        if: inputs.staging_release_evidence && env.ENVIRONMENT == 'staging'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: staging-release-evidence
+          path: ${{ runner.temp }}/staging-release-evidence
+
       - name: Sign in to Google Cloud
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
@@ -211,6 +222,32 @@ jobs:
             ' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/release.next.json"
             mv "$RUNNER_TEMP/release.next.json" "$RUNNER_TEMP/release.json"
           done
+
+      - name: Attach staging release evidence to the pushed app digest
+        if: inputs.staging_release_evidence && env.ENVIRONMENT == 'staging'
+        run: |
+          evidence="$RUNNER_TEMP/staging-release-evidence/staging-release-evidence.json"
+          digest="$(jq -er '.app.digest | select(test("^sha256:[a-f0-9]{64}$"))' "$RUNNER_TEMP/release.json")"
+          jq -e --arg sha "$GITHUB_SHA" '.sourceSha == $sha' "$evidence" >/dev/null
+          size="$(wc -c < "$evidence")"
+          if (( size > 2010000 )); then
+            echo '::error::Staging release evidence exceeds the publication limit.'
+            exit 1
+          fi
+          repository="${REGISTRY##*/}"
+          parent="projects/$PROJECT/locations/$REGION/repositories/$repository"
+          name="release-evidence-${digest:7:44}"
+          target="$parent/packages/app/versions/$digest"
+          file="$parent/files/sha256:$(sha256sum "$evidence" | cut -d ' ' -f 1)"
+          where=(--project="$PROJECT" --location="$REGION" --repository="$repository")
+          gcloud artifacts attachments list "${where[@]}" --target="$target" --format=json > "$RUNNER_TEMP/attachments.json"
+          if ! jq -e --arg name "$parent/attachments/$name" 'any(.[]; .name == $name)' "$RUNNER_TEMP/attachments.json" >/dev/null; then
+            gcloud artifacts attachments create "$name" "${where[@]}" --target="$target" --attachment-namespace=staging \
+              --attachment-type=release-evidence --files="$evidence" --quiet >/dev/null
+          fi
+          gcloud artifacts attachments describe "$name" "${where[@]}" --format=json | jq -e \
+            --arg name "$parent/attachments/$name" --arg target "$target" --arg file "$file" \
+            '.name == $name and .target == $target and .attachmentNamespace == "staging" and .type == "release-evidence" and .files == [$file]' >/dev/null
 
       - name: Deploy services without traffic
         run: |
